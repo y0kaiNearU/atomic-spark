@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atomic-spark"
+version = "0.1.0"
+description = "All-or-nothing multi-table Spark writes on Iceberg REST catalogs (Apache Polaris)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.28"]
+
+[project.optional-dependencies]
+spark = ["pyspark>=4.0"]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["atomic_spark*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+markers = ["integration: needs the docker compose stack (Polaris + Spark)"]
