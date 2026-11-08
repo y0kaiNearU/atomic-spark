@@ -16,7 +16,7 @@ from typing import Iterable
 
 import requests
 
-from .config import CatalogConfig
+from .clients import make_client
 from .errors import (
     CatalogError,
     CommitFailedError,
@@ -28,7 +28,6 @@ from .errors import (
 )
 from .model import TableRef, TableState, current_schema, main_snapshot, ref_snapshot
 from .rest import (
-    RestCatalogClient,
     assert_ref,
     assert_schema_id,
     assert_uuid,
@@ -66,7 +65,7 @@ class Transaction:
         enable_wap: bool = False,
         branch_prefix: str = "txn_",
         branch_max_age_ms: int | None = DEFAULT_BRANCH_MAX_AGE_MS,
-        client: RestCatalogClient | None = None,
+        client="auto",
         ops: SparkOps | None = None,
     ):
         if isinstance(tables, str) or isinstance(read_tables, str):
@@ -83,7 +82,8 @@ class Transaction:
         self.branch_max_age_ms = branch_max_age_ms
         self.id = uuid.uuid4().hex[:16]
         self.branch = f"{branch_prefix}{self.id}"
-        self.client = client or RestCatalogClient.from_config(CatalogConfig.from_spark(spark, catalog))
+        # "auto" | "jvm" | "http" (see clients.py), or any object with load_table / commit_transaction / commit_table
+        self.client = make_client(spark, catalog, client) if isinstance(client, str) else client
         self.ops = ops or SparkOps(spark, catalog)
         self.state = State.NEW
         self.published: dict[str, int] = {}  # table -> snapshot main now points to (after commit)
@@ -235,6 +235,10 @@ class Transaction:
             return
         except CatalogError as e:
             if e.status == 409:
+                # A client that retried internally can get 409 for a commit its first attempt applied.
+                if self._all_published(expected):
+                    log.warning("atomic-spark: commit returned 409 (%s) but every table is published", e)
+                    return
                 raise ConflictError(f"Another writer changed a table during the transaction; nothing was published ({e})") from e
             if e.status not in _OUTCOME_UNKNOWN_HTTP:
                 raise CommitFailedError(f"Catalog rejected the commit; nothing was published ({e})") from e
@@ -242,6 +246,12 @@ class Transaction:
         except requests.RequestException as e:
             cause = e
         self._resolve_unknown(expected, cause)
+
+    def _all_published(self, expected: dict[TableRef, tuple[int | None, int]]) -> bool:
+        try:
+            return all(main_snapshot(self.client.load_table(r)) == head for r, (_, head) in expected.items())
+        except Exception:  # noqa: BLE001
+            return False
 
     def _resolve_unknown(self, expected: dict[TableRef, tuple[int | None, int]], cause: Exception) -> None:
         """The commit response was lost or ambiguous: look at the tables to find out what happened."""

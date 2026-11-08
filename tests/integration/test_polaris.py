@@ -52,6 +52,22 @@ def spark():
     s.stop()
 
 
+@pytest.fixture(autouse=True, params=["jvm", "http"])
+def client_kind(request, monkeypatch):
+    """Run every test once through Spark's JVM Iceberg client and once through the Python HTTP client."""
+    monkeypatch.setenv("ATOMIC_SPARK_CLIENT", request.param)
+    return request.param
+
+
+def test_client_selection(spark, monkeypatch, client_kind):
+    from atomic_spark.clients import make_client
+    from atomic_spark.jvm import JvmCatalogClient
+
+    monkeypatch.delenv("ATOMIC_SPARK_CLIENT")
+    assert isinstance(make_client(spark, CAT), JvmCatalogClient)  # classic session -> JVM path by default
+    assert isinstance(make_client(spark, CAT, "http"), RestCatalogClient)
+
+
 @pytest.fixture(scope="session")
 def ns(spark):
     name = f"it_{int(time.time())}_{uuid.uuid4().hex[:4]}"

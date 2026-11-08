@@ -19,8 +19,18 @@ Requirements:
   e.g. Apache Polaris;
 - PySpark 4.x with the Iceberg Spark runtime and SQL extensions.
 
-The connection settings are read from your Spark catalog config (`uri`, `warehouse`, `credential` or
-`token`, `scope`, `header.*`).
+### Catalog access and authentication
+atomic-spark has no auth settings of its own; it reuses your `spark.sql.catalog.<name>.*` config.
+By default (`client="auto"`) it builds Iceberg's own Java REST client inside Spark's JVM from that
+config, so whatever login Spark uses also works for the multi-table commits: Keycloak or another
+OIDC provider via `oauth2-server-uri`, Polaris's built-in OAuth, `rest.auth.type` auth managers,
+token refresh, custom headers.
+
+| `client=` | How it talks to the catalog | When |
+|---|---|---|
+| `"auto"` (default) | `"jvm"` if available, else `"http"` | Always fine. `ATOMIC_SPARK_CLIENT=jvm\|http` overrides it. |
+| `"jvm"` | Iceberg Java `RESTCatalog` via py4j | Classic SparkSession. |
+| `"http"` | Built-in Python client: OAuth2 client credentials or a static `token` from the catalog config | Spark Connect (no JVM access). |
 
 ## How it works
 1. **Begin:** a branch `txn_<id>` is created on every listed table, in one catalog commit, at the

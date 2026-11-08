@@ -88,6 +88,22 @@ with atomic(spark, catalog="polaris", tables=["db.a", "db.b"]):
 - **Bug found by the integration tests and fixed:** branches weren't dropped when every declared
   table started empty. A regression unit test was added.
 
+## Auth-independent catalog access (2026-11-09)
+- **New default `client="auto"`:** atomic-spark builds Iceberg's Java `RESTCatalog` inside Spark's
+  JVM (via py4j, with `CatalogUtil.buildIcebergCatalog`) from the same Spark catalog options. Auth is
+  then whatever Iceberg itself does, so Keycloak and the other login setups need no extra config.
+  - Code: `atomic_spark/jvm.py`, with the client choice in `atomic_spark/clients.py`.
+- **Fallback:** the Python HTTP client stays, for Spark Connect or by explicit choice.
+  `ATOMIC_SPARK_CLIENT` overrides the choice.
+- **Iceberg 1.12 detail:** `TableCommit.create(...)` takes two metadata objects, so each commit is
+  built with `ImmutableTableCommit.builder()`.
+- **Hardening:** a 409 now checks whether the commit was already applied, which can happen when the
+  Java client retries internally, before reporting a `ConflictError`.
+- **Tests:**
+  - 71 unit tests;
+  - the integration suite runs every scenario with both clients (22 passed).
+- **Not yet tested:** a real Keycloak setup. Only Polaris's built-in OAuth has been exercised.
+
 ## Next steps
 - **M2:** lost-response and timeout tests against real Polaris (for example a proxy that drops the
   response), and a killed driver.
