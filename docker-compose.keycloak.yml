@@ -1,0 +1,55 @@
+# Adds Keycloak and a second Polaris realm, EXTERNAL, that only accepts Keycloak-issued tokens.
+# Start from fresh volumes, since the realms are bootstrapped once:
+#
+#   docker compose down -v
+#   docker compose -f docker-compose.yml -f docker-compose.keycloak.yml up -d --wait polaris-setup
+#   docker compose -f docker-compose.yml -f docker-compose.keycloak.yml run --rm -e POLARIS_AUTH=keycloak \
+#       spark pytest tests/integration
+#
+# Keycloak realm "iceberg" (docker/keycloak/iceberg-realm.json, from the Apache Polaris Keycloak guide)
+# has a service client client1:s3cr3t whose tokens carry principal_name=root and
+# principal_roles=["service_admin"], which Polaris maps to its root principal.
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.4
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    volumes:
+      - ./docker/keycloak/iceberg-realm.json:/opt/keycloak/data/import/iceberg-realm.json:ro
+    command: ["start-dev", "--import-realm", "--health-enabled=true"]
+    healthcheck:
+      test: "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"
+      interval: 5s
+      timeout: 2s
+      retries: 30
+
+  polaris-bootstrap:
+    command:
+      - bootstrap
+      - --realm=POLARIS
+      - --realm=EXTERNAL
+      - --credential=POLARIS,root,s3cr3t
+      - --credential=EXTERNAL,root,s3cr3t
+
+  polaris:
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS,EXTERNAL
+      POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,s3cr3t;EXTERNAL,root,s3cr3t
+      polaris.authentication."EXTERNAL".type: external
+      quarkus.oidc.tenant-enabled: "true"
+      quarkus.oidc.auth-server-url: http://keycloak:8080/realms/iceberg
+      quarkus.oidc.client-id: client1
+      quarkus.oidc.roles.role-claim-path: principal_roles
+      polaris.oidc.principal-mapper.id-claim-path: principal_id
+      polaris.oidc.principal-mapper.name-claim-path: principal_name
+      polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
+      polaris.oidc.principal-roles-mapper.mappings[0].replacement: PRINCIPAL_ROLE:$$1
+
+  polaris-setup:
+    environment:
+      KEYCLOAK_TOKEN_URL: http://keycloak:8080/realms/iceberg/protocol/openid-connect/token

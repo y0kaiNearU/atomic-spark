@@ -102,7 +102,20 @@ with atomic(spark, catalog="polaris", tables=["db.a", "db.b"]):
 - **Tests:**
   - 71 unit tests;
   - the integration suite runs every scenario with both clients (22 passed).
-- **Not yet tested:** a real Keycloak setup. Only Polaris's built-in OAuth has been exercised.
+
+## Keycloak auth tested (2026-11-15)
+- **Setup:** `docker-compose.keycloak.yml` is an override that adds Keycloak 26.7.4 and a second
+  Polaris realm, `EXTERNAL`, using `polaris.authentication."EXTERNAL".type: external`. That realm
+  accepts only Keycloak tokens.
+  - Keycloak realm `iceberg` (`docker/keycloak/iceberg-realm.json`): its client `client1:s3cr3t` maps
+    to Polaris's root principal.
+  - `docker/polaris/setup.sh` creates the `atomic` catalog in every realm that is enabled.
+  - `POLARIS_AUTH=keycloak` switches the integration tests to `oauth2-server-uri` (Keycloak) plus
+    `header.Polaris-Realm=EXTERNAL`.
+- **Results:** 22/22 pass with Keycloak auth, for both the JVM and the HTTP client. They also pass
+  with Polaris auth, both on the Keycloak stack and on the plain stack.
+- **Negative check:** in `EXTERNAL`, a Polaris-issued token gets 401 and a Keycloak token gets 200.
+  Polaris's own token endpoint returns 501 there. So the passing runs really went through Keycloak.
 
 ## Next steps
 - **M2:** lost-response and timeout tests against real Polaris (for example a proxy that drops the
@@ -124,6 +137,13 @@ On Git Bash, prefix the `run` command with `MSYS_NO_PATHCONV=1`.
 
 Tests: `pytest` runs the unit tests (needs no Spark).
 `docker compose run --rm spark pytest tests/integration` runs the integration tests (stack must be up).
+
+Keycloak variant (start from fresh volumes, because realms are bootstrapped only once):
+```sh
+docker compose down -v
+docker compose -f docker-compose.yml -f docker-compose.keycloak.yml up -d --wait polaris-setup
+docker compose -f docker-compose.yml -f docker-compose.keycloak.yml run --rm -e POLARIS_AUTH=keycloak spark pytest tests/integration
+```
 
 ## Files
 - `atomic_spark/`: the library. `README.md` has usage and limits.

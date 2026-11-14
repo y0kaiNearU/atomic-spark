@@ -30,9 +30,26 @@ pytestmark = pytest.mark.integration
 CAT = "polaris"
 
 
+def _auth_conf() -> dict[str, str]:
+    """POLARIS_AUTH=polaris (default): Polaris's built-in OAuth, realm POLARIS.
+    POLARIS_AUTH=keycloak: tokens from Keycloak only, realm EXTERNAL (docker-compose.keycloak.yml)."""
+    if os.environ.get("POLARIS_AUTH", "polaris") == "keycloak":
+        return {
+            "credential": "client1:s3cr3t",
+            "oauth2-server-uri": "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token",
+            "scope": "profile",
+            "header.Polaris-Realm": "EXTERNAL",
+        }
+    return {
+        "credential": os.environ.get("POLARIS_CREDENTIAL", "root:s3cr3t"),
+        "scope": "PRINCIPAL_ROLE:ALL",
+        "header.Polaris-Realm": "POLARIS",
+    }
+
+
 @pytest.fixture(scope="session")
 def spark():
-    s = (
+    b = (
         SparkSession.builder.master("local[2]")
         .appName("atomic-spark-it")
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
@@ -40,9 +57,11 @@ def spark():
         .config(f"spark.sql.catalog.{CAT}.type", "rest")
         .config(f"spark.sql.catalog.{CAT}.uri", os.environ.get("POLARIS_URI", "http://polaris:8181/api/catalog"))
         .config(f"spark.sql.catalog.{CAT}.warehouse", os.environ.get("POLARIS_WAREHOUSE", "atomic"))
-        .config(f"spark.sql.catalog.{CAT}.credential", os.environ.get("POLARIS_CREDENTIAL", "root:s3cr3t"))
-        .config(f"spark.sql.catalog.{CAT}.scope", "PRINCIPAL_ROLE:ALL")
-        .config("spark.hadoop.fs.permissions.umask-mode", "000")
+    )
+    for k, v in _auth_conf().items():
+        b = b.config(f"spark.sql.catalog.{CAT}.{k}", v)
+    s = (
+        b.config("spark.hadoop.fs.permissions.umask-mode", "000")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")
         .getOrCreate()
