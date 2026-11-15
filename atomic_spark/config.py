@@ -17,6 +17,7 @@ class CatalogConfig:
     scope: str = "catalog"
     oauth2_server_uri: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
+    timeout: float | None = None  # seconds; from rest.client.socket-timeout-ms, as Iceberg's Java client uses
 
     @classmethod
     def from_spark(cls, spark, catalog: str) -> "CatalogConfig":
@@ -44,7 +45,21 @@ class CatalogConfig:
             scope=opts.get("scope", "catalog"),
             oauth2_server_uri=opts.get("oauth2-server-uri"),
             headers={k[len("header."):]: v for k, v in opts.items() if k.startswith("header.")},
+            timeout=_timeout_s(opts, prefix),
         )
+
+
+def _timeout_s(opts: dict[str, str], prefix: str) -> float | None:
+    raw = opts.get("rest.client.socket-timeout-ms")
+    if raw is None:
+        return None
+    try:
+        ms = int(raw)
+    except ValueError:
+        raise TransactionUsageError(f"{prefix}.rest.client.socket-timeout-ms must be an integer, not {raw!r}") from None
+    if ms <= 0:
+        raise TransactionUsageError(f"{prefix}.rest.client.socket-timeout-ms must be positive, not {raw!r}")
+    return ms / 1000
 
 
 def _all_conf(spark) -> dict[str, str]:

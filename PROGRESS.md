@@ -42,9 +42,7 @@ with atomic(spark, catalog="polaris", tables=["db.a", "db.b"]):
 - [x] **M1 core library.** Done. See the M1 section below.
   - 60 unit tests (`tests/unit`, run without Spark against a fake catalog);
   - 10 integration tests (`tests/integration`) pass against real Polaris.
-- [ ] **M2 integration tests** (Docker). Some are already covered by M1: failure mid-job,
-  conflicting writer, decorator retry, empty tables, DDL. Still to do: commit timeout or lost
-  response against the real server, and a driver killed mid-block (orphaned branches).
+- [x] **M2 integration tests** (Docker). Done 2026-11-15. See the M2 section below.
 - [ ] **M3 operations:** `gc` for orphaned `txn_*` branches, logging, transaction ID in snapshot summaries.
 - [ ] **M4 extras:**
   - transactional CREATE TABLE: create up front, drop on rollback;
@@ -117,15 +115,43 @@ with atomic(spark, catalog="polaris", tables=["db.a", "db.b"]):
 - **Negative check:** in `EXTERNAL`, a Polaris-issued token gets 401 and a Keycloak token gets 200.
   Polaris's own token endpoint returns 501 there. So the passing runs really went through Keycloak.
 
+## M2: failure injection, and the in-flight race fixed (2026-11-15)
+- **`tests/integration/faultproxy.py`:** an HTTP proxy that sits between every catalog client and
+  Polaris. Spark's own client, both atomic-spark clients and the killed driver all go through it.
+  It only touches publish commits (`transactions/commit` that set `main`), in one of four modes:
+  - `drop`: not forwarded;
+  - `apply_then_drop`: applied, response discarded;
+  - `apply_then_504`: applied, 504 returned;
+  - `hold`: forwarded only after the test releases it.
+- **`tests/integration/test_failures.py`**, for both clients:
+  - commit never arrives: `CommitFailedError`, tables untouched and usable;
+  - applied but response lost, or 504: reported as committed;
+  - client times out while the request is held: `CommitFailedError`. Once released, Polaris rejects
+    the late request with 409.
+  - driver SIGKILLed mid-block (`killed_driver.py`): `main` untouched. The orphaned branch has
+    `max-ref-age-ms` set and doesn't block later blocks.
+- **Race fixed, not just documented:**
+  - **Before:** after a timeout with "nothing moved", the branches were dropped and failure reported.
+    The held request could still land later. Confirmed on real Polaris: the late request got 204 and
+    `main` moved.
+  - **Now:** the publish commit also asserts `txn branch == head`. On "nothing moved", the library
+    first drops the branches (the fence), then re-reads, then reports failure. If the fence itself
+    fails, it raises `CommitStateUnknownError` and keeps the branches.
+- **Observed:** neither client retries a publish whose request may have been sent. The proxy saw
+  exactly 1 publish request in every fault mode.
+- **`rest.client.socket-timeout-ms`** (Iceberg's option) now also sets the HTTP client's timeout.
+- **Test layout:** fixtures moved to `tests/integration/conftest.py`, helpers to `helpers.py`.
+- **Results:**
+  - 79 unit tests;
+  - 32 integration tests with Polaris auth;
+  - 32 integration tests with Keycloak auth.
+
 ## Next steps
-- **M2:** lost-response and timeout tests against real Polaris (for example a proxy that drops the
-  response), and a killed driver.
 - **M3:** a `gc` command for orphaned `txn_*` branches. These come from killed drivers, and from
   writes to unlisted WAP tables, which create their own `txn_*` branch that is never published.
-  Also: transaction ID in snapshot summaries, and structured logging.
-- **Known race (document or fix):** after a timeout, the library may see "nothing moved" and drop
-  the branches while the server is still applying the commit. `main` would still be valid, since
-  snapshots outlive refs, but the job would report failure for a commit that succeeded.
+  - It must not remove the branch of a transaction that is still running. Options: an age threshold
+    based on the branch's snapshot timestamps, or a transaction-ID or heartbeat property.
+  - Also: transaction ID in snapshot summaries, and structured logging.
 
 ## How to run
 ```sh

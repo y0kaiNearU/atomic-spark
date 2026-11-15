@@ -220,7 +220,9 @@ class Transaction:
             retention = {k: main_ref[k] for k in _REF_RETENTION_FIELDS if k in main_ref}
             changes.append(table_change(
                 ref,
-                [assert_uuid(s.uuid), assert_ref("main", s.start_main), assert_schema_id(schema_id)],
+                # The branch assertion lets _resolve_unknown fence off a commit that is still in flight.
+                [assert_uuid(s.uuid), assert_ref("main", s.start_main), assert_ref(self.branch, head),
+                 assert_schema_id(schema_id)],
                 [{**set_branch("main", head), **retention}],
             ))
             expected[ref] = (s.start_main, head)
@@ -254,22 +256,42 @@ class Transaction:
             return False
 
     def _resolve_unknown(self, expected: dict[TableRef, tuple[int | None, int]], cause: Exception) -> None:
-        """The commit response was lost or ambiguous: look at the tables to find out what happened."""
+        """The commit response was lost or ambiguous: look at the tables to find out what happened.
+
+        "Nothing moved" is not final by itself: the request may still be on its way to, or inside, the
+        server. So before reporting failure, drop the branches. The publish commit asserts each branch
+        is at its head, so once a branch is gone the in-flight commit can no longer apply. Then re-read.
+        """
         detail = {str(r): {"start": start, "branch_head": head} for r, (start, head) in expected.items()}
+        if self._outcome(expected, cause, detail) == "none":
+            try:
+                self.client.commit_transaction([table_change(r, [], [remove_ref(self.branch)]) for r in self.tables])
+            except Exception as e:  # noqa: BLE001
+                raise CommitStateUnknownError(
+                    f"Commit outcome unknown ({cause}): no table has moved yet, but the transaction branches "
+                    f"could not be dropped to stop the commit from still applying ({e}).", self.branch, detail
+                ) from cause
+            self._may_have_branches = False
+            if self._outcome(expected, cause, detail) == "none":
+                raise CommitFailedError(f"Commit failed ({cause}); verified that no table was changed") from cause
+
+    def _outcome(self, expected: dict[TableRef, tuple[int | None, int]], cause: Exception, detail: dict) -> str:
+        """Re-read every table: "all" published, or "none" moved. Raises CommitStateUnknownError otherwise."""
+        branch = self.branch if self._may_have_branches else None
         try:
             observed = {ref: main_snapshot(self.client.load_table(ref)) for ref in expected}
         except Exception as e:  # noqa: BLE001
             raise CommitStateUnknownError(
-                f"Commit outcome unknown ({cause}), and the tables could not be re-read ({e}).", self.branch, detail
+                f"Commit outcome unknown ({cause}), and the tables could not be re-read ({e}).", branch, detail
             ) from cause
         if all(observed[r] == head for r, (_, head) in expected.items()):
             log.warning("atomic-spark: commit response was lost (%s) but every table is published", cause)
-            return
+            return "all"
         if all(observed[r] == start for r, (start, _) in expected.items()):
-            raise CommitFailedError(f"Commit failed ({cause}); verified that no table was changed") from cause
+            return "none"
         for r in expected:
             detail[str(r)]["main_now"] = observed[r]
-        raise CommitStateUnknownError("Commit outcome unknown: tables are in a mixed state.", self.branch, detail) from cause
+        raise CommitStateUnknownError("Commit outcome unknown: tables are in a mixed state.", branch, detail) from cause
 
     # --------------------------------------------------------------- rollback
     def rollback(self) -> None:

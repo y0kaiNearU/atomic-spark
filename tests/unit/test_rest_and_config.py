@@ -128,3 +128,19 @@ def test_config_errors(override, match):
     d = {k: v for k, v in {**BASE, **override}.items() if v is not None}
     with pytest.raises(TransactionUsageError, match=match):
         CatalogConfig.from_spark(FakeSpark(d), "polaris")
+
+
+def test_socket_timeout_option_sets_http_timeout():
+    assert CatalogConfig.from_spark(FakeSpark(BASE), "polaris").timeout is None
+    assert RestCatalogClient.from_config(CatalogConfig.from_spark(FakeSpark(BASE), "polaris")).timeout == 60.0
+    conf = {**BASE, "spark.sql.catalog.polaris.rest.client.socket-timeout-ms": "2500"}
+    cfg = CatalogConfig.from_spark(FakeSpark(conf), "polaris")
+    assert cfg.timeout == 2.5
+    assert RestCatalogClient.from_config(cfg).timeout == 2.5
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-5"])
+def test_bad_socket_timeout_is_rejected(raw):
+    conf = {**BASE, "spark.sql.catalog.polaris.rest.client.socket-timeout-ms": raw}
+    with pytest.raises(TransactionUsageError, match="socket-timeout-ms"):
+        CatalogConfig.from_spark(FakeSpark(conf), "polaris")

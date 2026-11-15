@@ -45,6 +45,8 @@ class RestCatalogClient:
 
     @classmethod
     def from_config(cls, cfg: CatalogConfig, **kwargs) -> "RestCatalogClient":
+        if cfg.timeout is not None:
+            kwargs.setdefault("timeout", cfg.timeout)
         return cls(
             cfg.uri,
             warehouse=cfg.warehouse,
