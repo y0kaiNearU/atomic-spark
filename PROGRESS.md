@@ -42,9 +42,7 @@ with atomic(spark, catalog="polaris", tables=["db.a", "db.b"]):
 - [x] **M1 core library.** Done. See the M1 section below.
   - 60 unit tests (`tests/unit`, run without Spark against a fake catalog);
   - 10 integration tests (`tests/integration`) pass against real Polaris.
-- [ ] **M2 integration tests** (Docker). Some are already covered by M1: failure mid-job,
-  conflicting writer, decorator retry, empty tables, DDL. Still to do: commit timeout or lost
-  response against the real server, and a driver killed mid-block (orphaned branches).
+- [x] **M2 integration tests** (Docker). Done 2026-11-15. See the M2 section below.
 - [ ] **M3 operations:** `gc` for orphaned `txn_*` branches, logging, transaction ID in snapshot summaries.
 - [ ] **M4 extras:**
   - transactional CREATE TABLE: create up front, drop on rollback;
@@ -88,15 +86,72 @@ with atomic(spark, catalog="polaris", tables=["db.a", "db.b"]):
 - **Bug found by the integration tests and fixed:** branches weren't dropped when every declared
   table started empty. A regression unit test was added.
 
+## Auth-independent catalog access (2026-11-09)
+- **New default `client="auto"`:** atomic-spark builds Iceberg's Java `RESTCatalog` inside Spark's
+  JVM (via py4j, with `CatalogUtil.buildIcebergCatalog`) from the same Spark catalog options. Auth is
+  then whatever Iceberg itself does, so Keycloak and the other login setups need no extra config.
+  - Code: `atomic_spark/jvm.py`, with the client choice in `atomic_spark/clients.py`.
+- **Fallback:** the Python HTTP client stays, for Spark Connect or by explicit choice.
+  `ATOMIC_SPARK_CLIENT` overrides the choice.
+- **Iceberg 1.12 detail:** `TableCommit.create(...)` takes two metadata objects, so each commit is
+  built with `ImmutableTableCommit.builder()`.
+- **Hardening:** a 409 now checks whether the commit was already applied, which can happen when the
+  Java client retries internally, before reporting a `ConflictError`.
+- **Tests:**
+  - 71 unit tests;
+  - the integration suite runs every scenario with both clients (22 passed).
+
+## Keycloak auth tested (2026-11-15)
+- **Setup:** `docker-compose.keycloak.yml` is an override that adds Keycloak 26.7.4 and a second
+  Polaris realm, `EXTERNAL`, using `polaris.authentication."EXTERNAL".type: external`. That realm
+  accepts only Keycloak tokens.
+  - Keycloak realm `iceberg` (`docker/keycloak/iceberg-realm.json`): its client `client1:s3cr3t` maps
+    to Polaris's root principal.
+  - `docker/polaris/setup.sh` creates the `atomic` catalog in every realm that is enabled.
+  - `POLARIS_AUTH=keycloak` switches the integration tests to `oauth2-server-uri` (Keycloak) plus
+    `header.Polaris-Realm=EXTERNAL`.
+- **Results:** 22/22 pass with Keycloak auth, for both the JVM and the HTTP client. They also pass
+  with Polaris auth, both on the Keycloak stack and on the plain stack.
+- **Negative check:** in `EXTERNAL`, a Polaris-issued token gets 401 and a Keycloak token gets 200.
+  Polaris's own token endpoint returns 501 there. So the passing runs really went through Keycloak.
+
+## M2: failure injection, and the in-flight race fixed (2026-11-15)
+- **`tests/integration/faultproxy.py`:** an HTTP proxy that sits between every catalog client and
+  Polaris. Spark's own client, both atomic-spark clients and the killed driver all go through it.
+  It only touches publish commits (`transactions/commit` that set `main`), in one of four modes:
+  - `drop`: not forwarded;
+  - `apply_then_drop`: applied, response discarded;
+  - `apply_then_504`: applied, 504 returned;
+  - `hold`: forwarded only after the test releases it.
+- **`tests/integration/test_failures.py`**, for both clients:
+  - commit never arrives: `CommitFailedError`, tables untouched and usable;
+  - applied but response lost, or 504: reported as committed;
+  - client times out while the request is held: `CommitFailedError`. Once released, Polaris rejects
+    the late request with 409.
+  - driver SIGKILLed mid-block (`killed_driver.py`): `main` untouched. The orphaned branch has
+    `max-ref-age-ms` set and doesn't block later blocks.
+- **Race fixed, not just documented:**
+  - **Before:** after a timeout with "nothing moved", the branches were dropped and failure reported.
+    The held request could still land later. Confirmed on real Polaris: the late request got 204 and
+    `main` moved.
+  - **Now:** the publish commit also asserts `txn branch == head`. On "nothing moved", the library
+    first drops the branches (the fence), then re-reads, then reports failure. If the fence itself
+    fails, it raises `CommitStateUnknownError` and keeps the branches.
+- **Observed:** neither client retries a publish whose request may have been sent. The proxy saw
+  exactly 1 publish request in every fault mode.
+- **`rest.client.socket-timeout-ms`** (Iceberg's option) now also sets the HTTP client's timeout.
+- **Test layout:** fixtures moved to `tests/integration/conftest.py`, helpers to `helpers.py`.
+- **Results:**
+  - 79 unit tests;
+  - 32 integration tests with Polaris auth;
+  - 32 integration tests with Keycloak auth.
+
 ## Next steps
-- **M2:** lost-response and timeout tests against real Polaris (for example a proxy that drops the
-  response), and a killed driver.
 - **M3:** a `gc` command for orphaned `txn_*` branches. These come from killed drivers, and from
   writes to unlisted WAP tables, which create their own `txn_*` branch that is never published.
-  Also: transaction ID in snapshot summaries, and structured logging.
-- **Known race (document or fix):** after a timeout, the library may see "nothing moved" and drop
-  the branches while the server is still applying the commit. `main` would still be valid, since
-  snapshots outlive refs, but the job would report failure for a commit that succeeded.
+  - It must not remove the branch of a transaction that is still running. Options: an age threshold
+    based on the branch's snapshot timestamps, or a transaction-ID or heartbeat property.
+  - Also: transaction ID in snapshot summaries, and structured logging.
 
 ## How to run
 ```sh
@@ -108,6 +163,13 @@ On Git Bash, prefix the `run` command with `MSYS_NO_PATHCONV=1`.
 
 Tests: `pytest` runs the unit tests (needs no Spark).
 `docker compose run --rm spark pytest tests/integration` runs the integration tests (stack must be up).
+
+Keycloak variant (start from fresh volumes, because realms are bootstrapped only once):
+```sh
+docker compose down -v
+docker compose -f docker-compose.yml -f docker-compose.keycloak.yml up -d --wait polaris-setup
+docker compose -f docker-compose.yml -f docker-compose.keycloak.yml run --rm -e POLARIS_AUTH=keycloak spark pytest tests/integration
+```
 
 ## Files
 - `atomic_spark/`: the library. `README.md` has usage and limits.

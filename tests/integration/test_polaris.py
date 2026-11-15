@@ -2,18 +2,15 @@
 
     docker compose up -d --wait polaris-setup
     docker compose run --rm spark pytest tests/integration -v
+
+Fixtures are in conftest.py; failure injection is in test_failures.py.
 """
 
 from __future__ import annotations
 
-import os
-import time
-import uuid
-
 import pytest
 
-pyspark = pytest.importorskip("pyspark")
-from pyspark.sql import SparkSession  # noqa: E402
+pytest.importorskip("pyspark")
 
 from atomic_spark import (  # noqa: E402
     ConflictError,
@@ -22,68 +19,20 @@ from atomic_spark import (  # noqa: E402
     WapNotEnabledError,
     atomic,
 )
-from atomic_spark.config import CatalogConfig  # noqa: E402
-from atomic_spark.model import TableRef  # noqa: E402
 from atomic_spark.rest import RestCatalogClient  # noqa: E402
 
+from .helpers import CAT, refs, rows  # noqa: E402
+
 pytestmark = pytest.mark.integration
-CAT = "polaris"
 
 
-@pytest.fixture(scope="session")
-def spark():
-    s = (
-        SparkSession.builder.master("local[2]")
-        .appName("atomic-spark-it")
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config(f"spark.sql.catalog.{CAT}", "org.apache.iceberg.spark.SparkCatalog")
-        .config(f"spark.sql.catalog.{CAT}.type", "rest")
-        .config(f"spark.sql.catalog.{CAT}.uri", os.environ.get("POLARIS_URI", "http://polaris:8181/api/catalog"))
-        .config(f"spark.sql.catalog.{CAT}.warehouse", os.environ.get("POLARIS_WAREHOUSE", "atomic"))
-        .config(f"spark.sql.catalog.{CAT}.credential", os.environ.get("POLARIS_CREDENTIAL", "root:s3cr3t"))
-        .config(f"spark.sql.catalog.{CAT}.scope", "PRINCIPAL_ROLE:ALL")
-        .config("spark.hadoop.fs.permissions.umask-mode", "000")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
-    )
-    s.sparkContext.setLogLevel("ERROR")
-    yield s
-    s.stop()
+def test_client_selection(spark, monkeypatch, client_kind):
+    from atomic_spark.clients import make_client
+    from atomic_spark.jvm import JvmCatalogClient
 
-
-@pytest.fixture(scope="session")
-def ns(spark):
-    name = f"it_{int(time.time())}_{uuid.uuid4().hex[:4]}"
-    spark.sql(f"CREATE NAMESPACE {CAT}.{name}")
-    return name
-
-
-@pytest.fixture(scope="session")
-def rest(spark):
-    return RestCatalogClient.from_config(CatalogConfig.from_spark(spark, CAT))
-
-
-@pytest.fixture
-def make(spark, ns):
-    def _make(rows: bool = True, wap: bool = True) -> str:
-        t = f"{ns}.t_{uuid.uuid4().hex[:8]}"
-        props = "'format-version'='2'" + (", 'write.wap.enabled'='true'" if wap else "")
-        spark.sql(f"CREATE TABLE {CAT}.{t} (id BIGINT, v STRING) USING iceberg TBLPROPERTIES ({props})")
-        if rows:
-            spark.sql(f"INSERT INTO {CAT}.{t} VALUES (1,'a'),(2,'b'),(3,'c')")
-        return t
-
-    return _make
-
-
-def rows(spark, t, where="true"):
-    return spark.sql(f"SELECT count(*) FROM {CAT}.{t} WHERE {where}").collect()[0][0]
-
-
-def refs(rest, t):
-    md = rest.load_table(TableRef.parse(t, CAT))
-    return sorted((md.get("refs") or {}).keys())
+    monkeypatch.delenv("ATOMIC_SPARK_CLIENT")
+    assert isinstance(make_client(spark, CAT), JvmCatalogClient)  # classic session -> JVM path by default
+    assert isinstance(make_client(spark, CAT, "http"), RestCatalogClient)
 
 
 def test_commit_publishes_all_write_types_atomically(spark, rest, make):

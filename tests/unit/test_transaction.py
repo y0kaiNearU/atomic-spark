@@ -384,3 +384,83 @@ def test_mixed_state_keeps_branches_for_repair(cat, ops):
     assert t.state is State.UNKNOWN
     assert t.branch in cat.refs("db.a") and t.branch in cat.refs("db.b")
     assert ei.value.branch == t.branch and ops.wap is None
+
+
+# ------------------------------------------- in-flight commit after a lost response
+
+
+def _is_publish(changes):
+    return any(u.get("ref-name") == "main" for ch in changes for u in ch["updates"])
+
+
+def test_publish_commit_asserts_branch_head(cat, ops):
+    with tx(cat, ops, ["db.a"]) as t:
+        head = ops.write("db.a")
+    publish = next(c for c in cat.commits if _is_publish(c))
+    assert {"type": "assert-ref-snapshot-id", "ref": t.branch, "snapshot-id": head} in publish[0]["requirements"]
+
+
+def test_commit_still_in_flight_after_failure_can_never_apply(cat, ops):
+    """Request held up on its way to the server: the client times out, sees nothing moved and reports
+    failure. When the request finally arrives it must be rejected, or main would move after we said no."""
+    held = []
+    original = cat.commit_transaction
+
+    def commit(changes):
+        if _is_publish(changes) and not held:
+            held.append(changes)
+            raise requests.Timeout("read timed out")
+        return original(changes)
+
+    cat.commit_transaction = commit
+    a0, b0 = cat.main("db.a"), cat.main("db.b")
+    with pytest.raises(CommitFailedError, match="verified"):
+        with tx(cat, ops, ["db.a", "db.b"]) as t:
+            ops.write("db.a")
+            ops.write("db.b")
+    assert t.state is State.ROLLED_BACK
+    with pytest.raises(CatalogError) as ei:
+        original(held[0])  # the late arrival
+    assert ei.value.status == 409
+    assert (cat.main("db.a"), cat.main("db.b")) == (a0, b0)
+    assert branches(cat, "db.a") == branches(cat, "db.b") == []
+
+
+def test_commit_landing_while_outcome_is_checked_counts_as_committed(cat, ops):
+    """The held request lands after the first re-read but before the fence: the second re-read sees it."""
+    held = []
+    original = cat.commit_transaction
+
+    def commit(changes):
+        if _is_publish(changes) and not held:
+            held.append(changes)
+            raise requests.Timeout("read timed out")
+        if held and len(held) == 1 and any(u["action"] == "remove-snapshot-ref" for ch in changes for u in ch["updates"]):
+            held.append("landed")
+            original(held[0])  # lands just before the fence
+        return original(changes)
+
+    cat.commit_transaction = commit
+    with tx(cat, ops, ["db.a", "db.b"]) as t:
+        ha, hb = ops.write("db.a"), ops.write("db.b")
+    assert t.state is State.COMMITTED and t.published == {"db.a": ha, "db.b": hb}
+    assert (cat.main("db.a"), cat.main("db.b")) == (ha, hb)
+    assert branches(cat, "db.a") == branches(cat, "db.b") == []
+
+
+def test_failed_fence_is_unknown_and_keeps_branches(cat, ops):
+    original = cat.commit_transaction
+
+    def commit(changes):
+        if _is_publish(changes):
+            raise requests.Timeout("read timed out")
+        if t.state is State.ACTIVE and any(u["action"] == "remove-snapshot-ref" for ch in changes for u in ch["updates"]):
+            raise requests.ConnectionError("catalog unreachable")
+        return original(changes)
+
+    with pytest.raises(CommitStateUnknownError, match="could not be dropped") as ei:
+        with tx(cat, ops, ["db.a"]) as t:
+            ops.write("db.a")
+            cat.commit_transaction = commit
+    assert t.state is State.UNKNOWN and ei.value.branch == t.branch
+    assert t.branch in cat.refs("db.a")

@@ -19,8 +19,18 @@ Requirements:
   e.g. Apache Polaris;
 - PySpark 4.x with the Iceberg Spark runtime and SQL extensions.
 
-The connection settings are read from your Spark catalog config (`uri`, `warehouse`, `credential` or
-`token`, `scope`, `header.*`).
+### Catalog access and authentication
+atomic-spark has no auth settings of its own; it reuses your `spark.sql.catalog.<name>.*` config.
+By default (`client="auto"`) it builds Iceberg's own Java REST client inside Spark's JVM from that
+config, so whatever login Spark uses also works for the multi-table commits: Keycloak or another
+OIDC provider via `oauth2-server-uri`, Polaris's built-in OAuth, `rest.auth.type` auth managers,
+token refresh, custom headers.
+
+| `client=` | How it talks to the catalog | When |
+|---|---|---|
+| `"auto"` (default) | `"jvm"` if available, else `"http"` | Always fine. `ATOMIC_SPARK_CLIENT=jvm\|http` overrides it. |
+| `"jvm"` | Iceberg Java `RESTCatalog` via py4j | Classic SparkSession. |
+| `"http"` | Built-in Python client: OAuth2 client credentials or a static `token` from the catalog config | Spark Connect (no JVM access). |
 
 ## How it works
 1. **Begin:** a branch `txn_<id>` is created on every listed table, in one catalog commit, at the
@@ -51,8 +61,8 @@ with atomic(spark, "polaris", tables=["db.new_table"], enable_wap=True):
 |---|---|
 | `ConflictError` | Another writer changed a table (or a `read_tables` entry). Nothing published; safe to re-run. |
 | `DestructiveSchemaChangeError` | A column was dropped, renamed or narrowed during the block. Nothing published, but the DDL itself stays applied. |
-| `CommitFailedError` | The catalog rejected the commit. Nothing published. |
-| `CommitStateUnknownError` | The commit's outcome couldn't be determined. Branches are kept for inspection. |
+| `CommitFailedError` | The catalog rejected the commit, or its response was lost and atomic-spark verified nothing was published. Nothing published. |
+| `CommitStateUnknownError` | The commit's outcome couldn't be determined (the catalog was unreachable while checking). `.tables` has each table's start snapshot and branch head; `.branch` names the branch kept for inspection. |
 | `WapNotEnabledError` / `TransactionUsageError` | Setup problems, raised before anything runs. |
 
 ## Limits
@@ -68,12 +78,25 @@ with atomic(spark, "polaris", tables=["db.new_table"], enable_wap=True):
 - **Only catalog changes are covered.** External effects (APIs, files written outside the catalog)
   are not rolled back.
 - **DataFrames cached inside a block** keep their data after a rollback.
+- **A driver killed mid-block** leaves `main` untouched, and also leaves its `txn_*` branch behind.
+  The branch has `max-ref-age-ms` of 3 days, so snapshot expiry removes it. It does not block later
+  transactions.
+
+## Lost or late commit responses
+If the publish commit times out or its response is lost, atomic-spark re-reads every table. If all
+of them moved, the transaction committed. If none moved, the request might still be on its way to
+Polaris. So atomic-spark first drops the transaction branches, then re-reads, and only then reports
+`CommitFailedError`. The publish commit asserts that each branch is still at its head. So a request
+that arrives after that is rejected, and `main` can't move after the job was told it failed.
+Set `spark.sql.catalog.<name>.rest.client.socket-timeout-ms` to control the timeout. Both clients
+read it.
 
 ## Development
 ```sh
 pip install -e ".[test]" && pytest                      # unit tests (no Spark needed)
 docker compose up -d --wait polaris-setup               # Postgres + Polaris 1.8 + "atomic" catalog
-docker compose run --rm spark pytest tests/integration  # end-to-end against Polaris + Spark 4.1 + Iceberg 1.12
+docker compose run --rm spark pytest tests/integration  # end-to-end against Polaris + Spark 4.1 + Iceberg 1.12,
+                                                        # incl. failure injection (tests/integration/faultproxy.py)
 docker compose down -v
 ```
 On Git Bash for Windows, prefix `docker compose run` with `MSYS_NO_PATHCONV=1`.

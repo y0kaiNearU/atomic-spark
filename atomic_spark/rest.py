@@ -45,6 +45,8 @@ class RestCatalogClient:
 
     @classmethod
     def from_config(cls, cfg: CatalogConfig, **kwargs) -> "RestCatalogClient":
+        if cfg.timeout is not None:
+            kwargs.setdefault("timeout", cfg.timeout)
         return cls(
             cfg.uri,
             warehouse=cfg.warehouse,
@@ -66,11 +68,7 @@ class RestCatalogClient:
             return self._token  # type: ignore[return-value]
 
     def _fetch_token(self) -> None:
-        # Iceberg credential format: "client_id:client_secret" or just "client_secret".
-        cred = self.credential or ""
-        client_id, sep, secret = cred.partition(":")
-        if not sep:
-            client_id, secret = "", cred
+        client_id, _, secret = (self.credential or "").rpartition(":")
         data = {"grant_type": "client_credentials", "client_secret": secret, "scope": self.scope}
         if client_id:
             data["client_id"] = client_id

@@ -31,6 +31,7 @@ class atomic:  # noqa: N801 - reads like a keyword: `with atomic(...)`
     tables       every table the block writes to (required; writes to unlisted tables bypass the transaction)
     read_tables  tables the block only reads; the commit fails if they changed meanwhile
     enable_wap   set write.wap.enabled=true on listed tables that lack it (otherwise WapNotEnabledError)
+    client       "auto" (default) | "jvm" | "http": how to reach the catalog; see atomic_spark/clients.py
     """
 
     def __init__(

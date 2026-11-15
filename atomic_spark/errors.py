@@ -48,13 +48,16 @@ class CommitFailedError(AtomicSparkError):
 class CommitStateUnknownError(AtomicSparkError):
     """It could not be determined whether the commit was applied.
 
-    The transaction branches are kept so the state can be inspected and repaired by hand.
+    `tables` maps each table to its start snapshot, branch head and (when known) current main snapshot.
+    `branch` is the transaction branch kept on every table for inspection and repair, or None when it
+    was already dropped.
     """
 
-    def __init__(self, message: str, branch: str, tables: dict[str, dict]):
+    def __init__(self, message: str, branch: str | None, tables: dict[str, dict]):
         self.branch = branch
         self.tables = tables
-        super().__init__(f"{message} Branch {branch!r} was kept on every table for inspection: {tables}")
+        kept = f"Branch {branch!r} was kept on every table for inspection" if branch else "Snapshots"
+        super().__init__(f"{message} {kept}: {tables}")
 
 
 class CatalogError(AtomicSparkError):
